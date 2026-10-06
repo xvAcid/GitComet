@@ -2,7 +2,8 @@
 """Install a bundled GitComet build with a reversible native-titlebar launcher.
 
 Run as the desktop user, without sudo. Requires only the Python standard library.
-The original AppImage and GitComet's own settings are never modified.
+GitComet's own settings are never modified. An original AppImage is removed only
+when its exact path is explicitly supplied with --remove-appimage.
 """
 
 from __future__ import annotations
@@ -95,8 +96,20 @@ def paths() -> tuple[Path, Path]:
     return base, data / "applications"
 
 
-def bundle_info() -> dict:
-    info = json.loads((BUNDLE / "build-info.json").read_text(encoding="utf-8"))
+def runtime_dir(base: Path, state: dict | None, requested: Path | None = None) -> Path:
+    directory = Path(requested if requested is not None else (state or {}).get("install_dir", base))
+    if not directory.is_absolute() or any(char in str(directory) for char in ("%", "\n", "\r")):
+        raise Error("The installation directory must be absolute and cannot contain % or newlines.")
+    for path in (directory, directory / "bin"):
+        if path.is_symlink():
+            raise Error(f"Refusing a symbolic installation directory: {path}")
+        if path.exists() and not path.is_dir():
+            raise Error(f"Expected an installation directory, not a file: {path}")
+    return directory
+
+
+def bundle_info(bundle: Path | None = None) -> dict:
+    info = json.loads(((bundle or BUNDLE) / "build-info.json").read_text(encoding="utf-8"))
     if not isinstance(info, dict) or info.get("schema") != 1:
         raise Error("Unsupported build-info.json format.")
     version_tuple(info.get("version"))
@@ -107,15 +120,15 @@ def bundle_info() -> dict:
     return info
 
 
-def verified_binary(info: dict) -> tuple[Path, str]:
-    binary = BUNDLE / "bin/gitcomet"
+def verified_binary(info: dict, directory: Path | None = None) -> tuple[Path, str]:
+    binary = (directory or BUNDLE) / "bin/gitcomet"
     if not binary.is_file() or not os.access(binary, os.X_OK):
         raise Error(f"The bundle must contain an executable bin/gitcomet: {binary}")
     expected_hash = file_digest(binary)
     result = subprocess.run([str(binary), "--version"], capture_output=True, text=True, timeout=20, check=False)
     expected_version = "gitcomet " + info["version"]
     if result.returncode or result.stdout.strip().lower() != expected_version:
-        raise Error("The bundled binary failed its version check. No launchers were changed.\n" + result.stdout + result.stderr)
+        raise Error(f"The binary failed its version check: {binary}\n" + result.stdout + result.stderr)
     if file_digest(binary) != expected_hash:
         raise Error("The bundled binary changed during its version check.")
     return binary, expected_hash
@@ -141,7 +154,7 @@ def desktop_quote(value: str) -> str:
     return '"' + escaped + '"'
 
 
-def patched_desktop(data: bytes, wrapper: Path, version: str) -> bytes:
+def original_appimage(data: bytes) -> tuple[Path, str, str]:
     value = desktop_fields(data).get("Exec", "")
     # Preserve all arguments and field codes literally; never evaluate a shell.
     match = re.fullmatch(r'\s*("[^"\n]+"|[^\s"\n]+)(.*)', value)
@@ -151,11 +164,19 @@ def patched_desktop(data: bytes, wrapper: Path, version: str) -> bytes:
     image = re.fullmatch(r"gitcomet-v(\d+\.\d+\.\d+)-linux-x86_64(?:_[A-Za-z0-9-]+)?\.AppImage", Path(command).name)
     if not image:
         raise Error("The launcher must point directly to a GitComet Linux x86_64 AppImage.")
-    if version_tuple(image.group(1)) > version_tuple(version):
-        raise Error(f"Refusing to replace the newer AppImage {image.group(1)} with GitComet {version}.")
-    if not Path(command).is_absolute() or not Path(command).is_file():
-        raise Error(f"The original AppImage was not found at its absolute path: {command}")
-    replacement = desktop_quote(str(wrapper)) + match.group(2)
+    if not Path(command).is_absolute():
+        raise Error(f"The original AppImage needs an absolute path: {command}")
+    return Path(command), image.group(1), match.group(2)
+
+
+def patched_desktop(data: bytes, wrapper: Path, version: str, require_appimage: bool = True) -> bytes:
+    appimage, original_version, suffix = original_appimage(data)
+    if version_tuple(original_version) > version_tuple(version):
+        raise Error(f"Refusing to replace the newer AppImage {original_version} with GitComet {version}.")
+    if require_appimage and not appimage.is_file():
+        raise Error(f"The original AppImage was not found: {appimage}")
+    replacement = desktop_quote(str(wrapper)) + suffix
+    add_try_exec = "TryExec" not in desktop_fields(data)
     result = []
     section = ""
     for line in data.decode("utf-8").splitlines(keepends=True):
@@ -164,11 +185,54 @@ def patched_desktop(data: bytes, wrapper: Path, version: str) -> bytes:
         if section == "[Desktop Entry]":
             if line.startswith("Exec="):
                 line = "Exec=" + replacement + "\n"
+                if add_try_exec:
+                    line += "TryExec=" + str(wrapper) + "\n"
             elif line.startswith("TryExec="):
                 line = "TryExec=" + str(wrapper) + "\n"
             elif line.startswith("DBusActivatable="):
                 line = "DBusActivatable=false\n"
         result.append(line)
+    return "".join(result).encode("utf-8")
+
+
+def without_appimagelauncher_actions(data: bytes, appimage: Path) -> bytes:
+    """Remove only known helpers for this exact AppImage, preserving other actions."""
+    action_ids = {"AppImageLauncher-Remove-AppImage": "remove", "AppImageLauncher-Update-AppImage": "update",
+                  "Remove": "remove", "Update": "update"}
+    sections = []
+    for line in data.decode("utf-8").splitlines(keepends=True):
+        if line.startswith("[") or not sections:
+            sections.append((line.strip() if line.startswith("[") else "", []))
+        sections[-1][1].append(line)
+    removed = set()
+    for name, lines in sections:
+        action = name.removeprefix("[Desktop Action ").removesuffix("]")
+        if action not in action_ids:
+            continue
+        fields = dict(line.rstrip("\r\n").split("=", 1) for line in lines if "=" in line and not line.startswith("#"))
+        try:
+            args = shlex.split(fields.get("Exec", ""))
+        except ValueError:
+            continue
+        if not args or not Path(args[0]).is_absolute() or args[-1] != str(appimage):
+            continue
+        helper = Path(args[0])
+        standard = len(args) == 2 and helper.parent.name == "appimagelauncher" and helper.name == action_ids[action]
+        lite = (len(args) == 3 and helper.parent.name == "appimagelauncher-lite"
+                and helper.name == "appimagelauncher-lite.AppImage" and args[1] == action_ids[action])
+        if standard or lite:
+            removed.add(action)
+    if not removed:
+        return data
+    result = []
+    for name, lines in sections:
+        if name in {"[Desktop Action " + action + "]" for action in removed}:
+            continue
+        for line in lines:
+            if name == "[Desktop Entry]" and line.startswith("Actions="):
+                actions = [action for action in line.rstrip("\r\n").split("=", 1)[1].split(";") if action and action not in removed]
+                line = "Actions=" + ";".join(actions) + (";" if actions else "") + "\n"
+            result.append(line)
     return "".join(result).encode("utf-8")
 
 
@@ -245,6 +309,8 @@ def checked_launchers(base: Path, appdir: Path, state: dict, restoring: bool = F
         allowed = {record["installed_sha256"]}
         if restoring or state.get("installing"):
             allowed.add(record["original_sha256"])
+            if "previous_installed_sha256" in record:
+                allowed.add(record["previous_installed_sha256"])
         if not path.is_file() or file_digest(path) not in allowed:
             raise Error(f"A launcher has changed since installation; it will not be overwritten: {path}")
         checked.append((record, original))
@@ -271,70 +337,188 @@ def checked_owned_files(base: Path, state: dict | None) -> None:
             raise Error(f"An installed file has changed; it will not be overwritten: {path}")
 
 
+def checked_previous_runtime(base: Path, state: dict) -> list[Path]:
+    """Validate the old files before cleanup; missing files allow interrupted cleanup."""
+    previous = state.get("moved_from")
+    if not previous:
+        return []
+    directory = runtime_dir(base, previous)
+    if directory == runtime_dir(base, state):
+        raise Error("Invalid move journal: source and destination are identical.")
+    paths_to_remove = []
+    for name, key in (("bin/gitcomet", "binary_sha256"), ("run", "wrapper_sha256")):
+        path = directory / name
+        if not SHA256.fullmatch(str(previous.get(key, ""))):
+            raise Error("Invalid previous-runtime checksum in the move journal.")
+        if path.is_symlink() or (path.exists() and (not path.is_file() or file_digest(path) != previous[key])):
+            raise Error(f"A previous installation file has changed; it will not be removed: {path}")
+        if path.is_file():
+            paths_to_remove.append(path)
+    return paths_to_remove
+
+
+def references_appimage(data: bytes, appimage: Path) -> bool:
+    # Check all sections, including Desktop Actions; unrelated actions stay intact.
+    for line in data.decode("utf-8").splitlines():
+        if "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        if key.strip() in ("Exec", "TryExec", "Icon"):
+            unescaped = re.sub(r"\\([sntr\\])", lambda m: {"s": " ", "n": "\n", "t": "\t", "r": "\r", "\\": "\\"}.get(m[1], m[1]), value)
+            if str(appimage) in value or str(appimage) in unescaped:
+                return True
+    return False
+
+
+def removal_request(requested: Path | None, originals: list[bytes], updated: list[bytes]) -> tuple[Path, str | None] | None:
+    if requested is None:
+        return None
+    appimage = Path(requested)
+    if not appimage.is_absolute() or appimage.suffix != ".AppImage":
+        raise Error("--remove-appimage requires one exact absolute .AppImage path.")
+    if appimage not in {original_appimage(data)[0] for data in originals}:
+        raise Error("The requested AppImage is not an original target in the managed launcher backups.")
+    if appimage.is_symlink() or (appimage.exists() and not appimage.is_file()):
+        raise Error(f"Only the explicitly supplied regular AppImage can be removed: {appimage}")
+    if any(references_appimage(data, appimage) for data in updated):
+        raise Error(f"A managed launcher still references {appimage} in Exec, TryExec, Icon or a Desktop Action; it cannot be removed.")
+    return appimage, file_digest(appimage) if appimage.is_file() else None
+
+
+def remove_requested_appimage(request: tuple[Path, str | None] | None, base: Path, appdir: Path, state: dict) -> None:
+    if request is None:
+        return
+    appimage, expected_hash = request
+    checked_owned_files(runtime_dir(base, state), state)
+    checked_launchers(base, appdir, state)
+    if any(references_appimage(Path(record["path"]).read_bytes(), appimage) for record in state["files"]):
+        raise Error("A launcher still references the AppImage; it has not been removed.")
+    if appimage.is_symlink() or (appimage.exists() and (not appimage.is_file() or file_digest(appimage) != expected_hash)):
+        raise Error(f"The AppImage changed during installation; it has not been removed: {appimage}")
+    if appimage.is_file():
+        appimage.unlink()
+        print(f"Removed the explicitly requested AppImage: {appimage}")
+    else:
+        print(f"The explicitly requested AppImage is already absent: {appimage}")
+
+
 def refresh_desktop(appdir: Path) -> None:
     utility = shutil.which("update-desktop-database")
     if utility:
         subprocess.run([utility, str(appdir)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
 
 
-def apply() -> None:
+def apply(install_dir: Path | None = None, bundle: Path | None = None,
+          remove_appimage: Path | None = None) -> None:
     base, appdir = paths()
-    info = bundle_info()
+    info = bundle_info(bundle)
     existing = load_state(base)
     active = existing is not None and existing["active"]
+    current = runtime_dir(base, existing)
+    destination = runtime_dir(base, existing, install_dir)
+    moving = current != destination
+    if existing and existing.get("installing") and moving:
+        raise Error("Finish the interrupted installation at its recorded directory before moving it again.")
     if active and version_tuple(existing["version"]) > version_tuple(info["version"]):
         raise Error("Refusing to downgrade the active native-titlebar installation.")
-    checked_owned_files(base, existing)
+    checked_owned_files(current, existing)
+    if moving:
+        checked_owned_files(destination, None)
+    if existing:
+        checked_previous_runtime(base, existing)
     retained = checked_launchers(base, appdir, existing) if active else []
     known = {Path(record["path"]) for record, _ in retained}
-    additions = discover_launchers(appdir, base / "run", info["version"], known)
-    if not os.environ.get("DISPLAY"):
-        raise Error("XWayland DISPLAY is unavailable. Run this from a terminal in your GNOME desktop session.")
-    binary, binary_hash = verified_binary(info)
-    wrapper = wrapper_bytes(base)
-    if active and not existing.get("installing") and existing["binary_sha256"] == binary_hash and not additions:
-        print(f"GitComet {info['version']} with native titlebar is already installed. Close GitComet completely and reopen its launcher.")
-        return
-    # Recheck after the executable preflight, before any installation writes.
-    checked_owned_files(base, existing)
-    if active:
-        checked_launchers(base, appdir, existing)
-    for path, original, _ in additions:
-        if path.is_symlink() or path.read_bytes() != original:
-            raise Error(f"A launcher changed during the preflight: {path}")
-    records = [dict(record) for record, _ in retained]
-    updates = []
-    for record, original in retained:
-        modified = patched_desktop(original, base / "run", info["version"])
-        if digest(modified) != record["installed_sha256"]:
-            raise Error("This installer cannot change an existing launcher format; restore before reinstalling.")
+    additions = discover_launchers(appdir, destination / "run", info["version"], known)
+    records, updates = [], []
+    for old_record, original in retained:
+        record = dict(old_record)
+        modified = patched_desktop(original, destination / "run", info["version"], require_appimage=False)
+        if record.get("appimage_actions_removed") or remove_appimage == original_appimage(original)[0]:
+            cleaned = without_appimagelauncher_actions(modified, original_appimage(original)[0])
+            if cleaned != modified:
+                record["appimage_actions_removed"] = True
+            modified = cleaned
+        installed_hash = digest(modified)
+        if installed_hash != record["installed_sha256"]:
+            record.setdefault("previous_installed_sha256", record["installed_sha256"])
+        record["installed_sha256"] = installed_hash
+        records.append(record)
         updates.append((Path(record["path"]), modified, record["mode"]))
     for path, original, modified in additions:
         backup = base / "backups" / (digest(str(path).encode())[:16] + ".desktop")
         record = {"path": str(path), "backup": str(backup), "mode": stat.S_IMODE(path.stat().st_mode),
                   "original_sha256": digest(original), "installed_sha256": digest(modified)}
-        write_atomic(backup, original, 0o600)
+        if remove_appimage == original_appimage(original)[0]:
+            cleaned = without_appimagelauncher_actions(modified, original_appimage(original)[0])
+            if cleaned != modified:
+                record["appimage_actions_removed"] = True
+                record["installed_sha256"] = digest(cleaned)
+            modified = cleaned
         records.append(record)
         updates.append((path, modified, record["mode"]))
+    launcher_changes = any(record != old for record, (old, _) in zip(records, retained))
+    removal = removal_request(remove_appimage,
+                              [original for _, original in retained] + [original for _, original, _ in additions],
+                              [modified for _, modified, _ in updates])
+    if not os.environ.get("DISPLAY"):
+        raise Error("XWayland DISPLAY is unavailable. Run this from a terminal in your GNOME desktop session.")
+    binary, binary_hash = verified_binary(info, bundle)
+    wrapper = wrapper_bytes(destination)
+    if (active and not existing.get("installing") and not moving and not launcher_changes and not additions
+            and existing["binary_sha256"] == binary_hash
+            and existing.get("wrapper_sha256", digest(wrapper_bytes(current))) == digest(wrapper)):
+        if removal:
+            verified_binary(info, destination)
+            remove_requested_appimage(removal, base, appdir, existing)
+        print(f"GitComet {info['version']} with native titlebar is already installed. Close GitComet completely and reopen its launcher.")
+        return
+    # Recheck after the executable preflight, before any installation writes.
+    checked_owned_files(current, existing)
+    if moving:
+        checked_owned_files(destination, None)
+    if existing:
+        checked_previous_runtime(base, existing)
+    if active:
+        checked_launchers(base, appdir, existing)
+    for path, original, _ in additions:
+        if path.is_symlink() or path.read_bytes() != original:
+            raise Error(f"A launcher changed during the preflight: {path}")
+    for (path, original, _), record in zip(additions, records[len(retained):]):
+        write_atomic(Path(record["backup"]), original, 0o600)
     state = {"schema": 1, "version": info["version"], "commit": info["commit"], "active": True,
+             "install_dir": str(destination),
              "binary_sha256": binary_hash, "wrapper_sha256": digest(wrapper), "files": records,
              "installing": True,
-             "previous_binary_sha256": file_digest(base / "bin/gitcomet") if (base / "bin/gitcomet").is_file() else None,
-             "previous_wrapper_sha256": file_digest(base / "run") if (base / "run").is_file() else None}
-    # Journal both old and intended hashes before replacing files. An interrupted
-    # install can be retried, or --restore can recover the original AppImage links.
+             "previous_binary_sha256": file_digest(destination / "bin/gitcomet") if (destination / "bin/gitcomet").is_file() else None,
+             "previous_wrapper_sha256": file_digest(destination / "run") if (destination / "run").is_file() else None}
+    if existing and existing.get("moved_from"):
+        state["moved_from"] = existing["moved_from"]
+    elif moving and existing:
+        state["moved_from"] = {"install_dir": str(current),
+                               "binary_sha256": existing["binary_sha256"],
+                               "wrapper_sha256": existing.get("wrapper_sha256", digest(wrapper_bytes(current)))}
+    # Journal both runtime locations and launcher hashes before replacing files.
+    # Retrying a partial move recognizes the old and new launcher bytes.
     save_state(base, state)
-    copy_binary(binary, base / "bin/gitcomet", binary_hash)
-    write_atomic(base / "run", wrapper, 0o755)
+    copy_binary(binary, destination / "bin/gitcomet", binary_hash)
+    write_atomic(destination / "run", wrapper, 0o755)
+    if verified_binary(info, destination)[1] != binary_hash:
+        raise Error("The installed binary changed before launcher activation.")
     for path, modified, mode in updates:
         write_atomic(path, modified, mode)
-    for key in ("installing", "previous_binary_sha256", "previous_wrapper_sha256"):
-        state.pop(key)
+    checked_owned_files(destination, {**state, "installing": False})
+    for path in checked_previous_runtime(base, state):
+        path.unlink()
+    for record in state["files"]:
+        record.pop("previous_installed_sha256", None)
+    for key in ("installing", "previous_binary_sha256", "previous_wrapper_sha256", "moved_from"):
+        state.pop(key, None)
     save_state(base, state)
     refresh_desktop(appdir)
+    remove_requested_appimage(removal, base, appdir, state)
     print(f"Installed GitComet {info['version']}. Close GitComet completely and reopen it through its existing launcher.")
-    print(f"Terminal launcher: {shlex.quote(str(base / 'run'))}")
-    print("The original AppImage is preserved. Restore its launchers: python3 install.py --restore")
+    print(f"Terminal launcher: {shlex.quote(str(destination / 'run'))}")
+    print("Original launcher backups are retained. --restore requires the original AppImage files to exist.")
 
 
 def restore() -> None:
@@ -344,6 +528,10 @@ def restore() -> None:
         print("There is no active launcher change to restore.")
         return
     checked = checked_launchers(base, appdir, state, restoring=True)
+    for _, original in checked:
+        appimage = original_appimage(original)[0]
+        if not appimage.is_file():
+            raise Error(f"Cannot restore: the original AppImage is missing: {appimage}. Restore that file first; launchers were not changed.")
     for record, original in checked:
         write_atomic(Path(record["path"]), original, record["mode"])
     state["active"] = False
@@ -358,13 +546,15 @@ def status() -> None:
     if not state or not state["active"]:
         print("Native-titlebar launchers are not active.")
         return
-    checked_owned_files(base, state)
+    directory = runtime_dir(base, state)
+    checked_owned_files(directory, state)
+    checked_previous_runtime(base, state)
     checked_launchers(base, appdir, state)
     if state.get("installing"):
         print("An installation was interrupted. Rerun install.py to finish, or use --restore.")
     else:
         print(f"GitComet {state['version']} native-titlebar launchers are active; installed file checksums match.")
-    print(f"Launcher: {base / 'run'}")
+    print(f"Launcher: {directory / 'run'}")
     print(f"Original launchers backed up: {len(state['files'])}")
 
 
@@ -374,7 +564,12 @@ def main() -> int:
     modes.add_argument("--apply", action="store_true", help="install or upgrade the bundled build (default)")
     modes.add_argument("--restore", action="store_true", help="restore the original AppImage launchers")
     modes.add_argument("--status", action="store_true", help="check the active installation without changing it")
+    parser.add_argument("--bundle", type=Path, help="directory containing build-info.json and bin/gitcomet")
+    parser.add_argument("--install-dir", type=Path, help="absolute runtime directory; later upgrades remember it")
+    parser.add_argument("--remove-appimage", type=Path, help="remove exactly this managed original .AppImage after successful installation")
     args = parser.parse_args()
+    if (args.restore or args.status) and (args.bundle or args.install_dir or args.remove_appimage):
+        parser.error("--bundle, --install-dir and --remove-appimage are installation options")
     if os.geteuid() == 0:
         raise Error("Run this installer without sudo, as your desktop user.")
     if sys.platform != "linux" or os.uname().machine != "x86_64":
@@ -384,7 +579,7 @@ def main() -> int:
     elif args.status:
         status()
     else:
-        apply()
+        apply(install_dir=args.install_dir, bundle=args.bundle, remove_appimage=args.remove_appimage)
     return 0
 
 

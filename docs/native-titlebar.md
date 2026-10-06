@@ -46,7 +46,8 @@ The installer supports an existing GitComet Linux x86_64 AppImage installation
 with a user launcher named `gitcomet.desktop` or
 `appimagekit_*-GitComet.desktop`. The original AppImage must be no newer than the
 bundle being installed. RPM and other launcher formats are not supported by this
-installer. The original AppImage and GitComet's settings are preserved.
+installer. The original AppImage is kept unless its removal is explicitly
+requested with `--remove-appimage`.
 
 Install the X11 keyboard runtime library if needed:
 
@@ -63,13 +64,40 @@ python3 install.py --status
 ```
 
 Launch GitComet through the application menu so that its native-titlebar wrapper
-runs. To
-upgrade, extract a new archive and run the new `install.py`; the installer keeps
+runs. To upgrade, extract a new archive and run the new `install.py`; the installer keeps
 the original launcher backups. To restore those launchers:
 
 ```sh
 python3 install.py --restore
 ```
+
+### Choose the program directory
+
+Use `--install-dir` to install or move the runnable program to a directory such
+as `~/Application/GitComet`:
+
+```sh
+python3 install.py --install-dir "$HOME/Application/GitComet"
+```
+
+The executable is stored in `bin/gitcomet` under that directory and the launcher
+is `run`. Existing application-menu entries are updated to use the new launcher.
+The installer remembers the directory for later upgrades; state and launcher
+backups stay in the existing user data directory.
+
+A separately downloaded newer installer can use an already extracted bundle:
+
+```sh
+python3 /path/to/new/install.py \
+  --bundle /path/to/gitcomet-native-titlebar \
+  --install-dir "$HOME/Application/GitComet"
+```
+
+To remove an old AppImage after the new program and launcher are installed,
+add `--remove-appimage /absolute/path/to/old.AppImage`. The installer accepts
+only an original AppImage associated with its managed launchers. Subsequent
+upgrades continue to work after this removal. Restoring the original launchers
+requires that AppImage to exist again at its original path.
 
 For a temporary launch directly from a source build, use:
 

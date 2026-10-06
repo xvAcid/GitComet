@@ -11,7 +11,8 @@ Fedora / GNOME, x86_64:
   python3 install.py
 
 This installer updates existing user launchers for a GitComet Linux x86_64
-AppImage, preserving the original AppImage and launcher backups. It recognizes
+AppImage and keeps launcher backups. The original AppImage is retained unless
+its removal is requested with --remove-appimage. It recognizes
 gitcomet.desktop and appimagekit_*-GitComet.desktop in your applications folder.
 The original AppImage must not be newer than this bundle. RPM and other launcher
 formats are not supported by this installer.
@@ -28,9 +29,20 @@ Check installed state:
 Restore the previous launchers:
   python3 install.py --restore
 
-The installer works in your user account and does not need sudo. The original
-AppImage remains available. To upgrade this fork, extract a newer archive
-and run its install.py; the original launcher backups remain available.
+Choose or move the program directory:
+  python3 install.py --install-dir "$HOME/Application/GitComet"
+
+Launch directly from that directory:
+  "$HOME/Application/GitComet/run"
+
+A newer standalone installer can use this extracted bundle with --bundle PATH.
+The chosen program directory is remembered for later upgrades. Installation
+state and original launcher backups stay in the user data directory.
+
+The installer works in your user account and does not need sudo. To upgrade
+this fork, extract a newer archive and run its install.py. To remove a specific
+original AppImage after successful installation, pass --remove-appimage with
+its absolute path. Restore requires that AppImage to be present again.
 
 More details and the update workflow: docs/native-titlebar.md in the source repo.
 Licenses and notices, including the embedded fonts, are in licenses/.

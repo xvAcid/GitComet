@@ -89,7 +89,7 @@ class InstallerTest(unittest.TestCase):
             '    print(' + repr('gitcomet ' + version) + ')\n'
             '    raise SystemExit(0)\n'
             'with open(os.environ["NATIVE_INSTALLER_TEST_OUTPUT"], "w") as stream:\n'
-            '    json.dump({"argv": sys.argv[1:], "native": os.getenv("GITCOMET_NATIVE_TITLEBAR"), '
+            '    json.dump({"executable": sys.argv[0], "argv": sys.argv[1:], "native": os.getenv("GITCOMET_NATIVE_TITLEBAR"), '
             '"wayland_display": os.getenv("WAYLAND_DISPLAY"), "wayland_socket": os.getenv("WAYLAND_SOCKET"), '
             '"display": os.getenv("DISPLAY")}, stream)\n')
         binary.chmod(0o755)
@@ -444,6 +444,353 @@ class InstallerTest(unittest.TestCase):
         with mock.patch.object(sys, 'argv', ['install.py']), mock.patch.object(mod.os, 'geteuid', return_value=1000):
             self.assertEqual(mod.main(), 0)
         self.assertTrue(mod.load_state(mod.paths()[0])['active'])
+
+    def test_separate_installer_bundle_and_fresh_custom_runtime(self):
+        desktop, original, appimage = self.make_launcher(suffix=' --existing "two words" %U')
+        destination = self.root / 'Application' / 'GitComet'
+        installer_only = self.root / 'Downloaded installer'
+        installer_only.mkdir()
+        argv = ['install.py', '--bundle', str(self.bundle), '--install-dir', str(destination),
+                '--remove-appimage', str(appimage)]
+        with mock.patch.object(mod, 'BUNDLE', installer_only), mock.patch.object(sys, 'argv', argv), \
+                mock.patch.object(mod.os, 'geteuid', return_value=1000):
+            self.assertEqual(mod.main(), 0)
+        base, _ = mod.paths()
+        state = mod.load_state(base)
+        self.assertEqual(state['install_dir'], str(destination))
+        self.assertEqual(Path(state['files'][0]['backup']).read_bytes(), original)
+        self.assertFalse(appimage.exists())
+        self.assertFalse((base / 'bin/gitcomet').exists())
+        self.assertFalse((base / 'run').exists())
+        self.assertFalse((destination / 'run').is_symlink())
+        self.assertFalse((destination / 'bin/gitcomet').is_symlink())
+        self.assertEqual(mod.desktop_fields(desktop.read_bytes())['Icon'], 'gitcomet')
+        self.assertIn(b' --existing "two words" %U\n', desktop.read_bytes())
+        subprocess.run([str(destination / 'run'), 'repository with spaces'], check=True)
+        result = json.loads((self.root / 'launched.json').read_text())
+        self.assertEqual(result['executable'], str(destination / 'bin/gitcomet'))
+        self.assertEqual(result['native'], '1')
+        self.assertIsNone(result['wayland_display'])
+        self.assertEqual(result['argv'], ['repository with spaces'])
+
+    def test_relocates_legacy_runtime_and_preserves_original_backups(self):
+        entries, legacy = self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application' / 'GitComet'
+        mod.apply(install_dir=destination)
+        state = mod.load_state(base)
+        self.assertEqual(state['version'], '0.2.6')
+        self.assertEqual(state['install_dir'], str(destination))
+        self.assertFalse((base / 'run').exists())
+        self.assertFalse((base / 'bin/gitcomet').exists())
+        self.assertTrue((base / 'state.json').is_file())
+        for old, new in zip(legacy['files'], state['files']):
+            self.assertNotEqual(old['installed_sha256'], new['installed_sha256'])
+            self.assertEqual({k: v for k, v in old.items() if k != 'installed_sha256'},
+                             {k: v for k, v in new.items() if k != 'installed_sha256'})
+        for desktop, original, appimage in entries:
+            self.assertTrue(appimage.is_file())  # Moving alone never authorizes removal.
+            self.assertIn(str(destination / 'run'), desktop.read_text())
+        mod.restore()
+        for desktop, original, _ in entries:
+            self.assertEqual(desktop.read_bytes(), original)
+
+    def test_move_delete_then_future_upgrade_remembers_runtime_directory(self):
+        desktop, original, appimage = self.make_launcher()
+        other, _, other_appimage = self.make_launcher('appimagekit_other-GitComet.desktop', version='0.2.6')
+        mod.apply()
+        base, _ = mod.paths()
+        # The previously shipped 0.2.6 installer did not record install_dir.
+        previous = mod.load_state(base)
+        previous.pop('install_dir')
+        mod.save_state(base, previous)
+        destination = self.root / 'Application' / 'GitComet'
+        other_contents = other_appimage.read_bytes()
+        mod.apply(install_dir=destination, remove_appimage=appimage)
+        self.assertFalse(appimage.exists())
+        self.assertEqual(other_appimage.read_bytes(), other_contents)
+        self.assertFalse((base / 'run').exists())
+        self.assertFalse((base / 'bin/gitcomet').exists())
+        self.make_metadata(version='0.2.7')
+        self.make_binary(version='0.2.7')
+        mod.apply()  # No flags: retains the selected runtime, despite missing AppImage.
+        state = mod.load_state(base)
+        self.assertEqual(state['install_dir'], str(destination))
+        self.assertEqual(state['version'], '0.2.7')
+        self.assertEqual(mod.file_digest(destination / 'bin/gitcomet'), mod.file_digest(self.bundle / 'bin/gitcomet'))
+        self.assertIn(str(destination / 'run'), desktop.read_text())
+        self.assertIn(str(destination / 'run'), other.read_text())
+        mod.status()
+        before = self.snapshot()
+        with self.assertRaisesRegex(mod.Error, 'Cannot restore.*AppImage is missing'):
+            mod.restore()
+        self.assertEqual(before, self.snapshot())
+        self.assertIn('Icon=gitcomet\n', original.decode())
+
+    def test_remove_appimage_rejects_unmanaged_path_and_symlink(self):
+        _, _, appimage = self.make_launcher()
+        other = self.root / 'unmanaged.AppImage'
+        other.write_bytes(b'not managed')
+        for request in (other, Path('relative.AppImage'), self.root / '*.AppImage'):
+            with self.subTest(request=request):
+                before = self.snapshot()
+                with self.assertRaises(mod.Error):
+                    mod.apply(remove_appimage=request)
+                self.assertEqual(before, self.snapshot())
+        appimage.unlink()
+        appimage.symlink_to(other)
+        with self.assertRaisesRegex(mod.Error, 'regular AppImage'):
+            mod.apply(remove_appimage=appimage)
+        self.assertTrue(appimage.is_symlink())
+        self.assertEqual(other.read_bytes(), b'not managed')
+        self.assertIsNone(mod.load_state(mod.paths()[0]))
+
+    def test_remove_appimage_rejects_surviving_icon_or_action_references(self):
+        desktop, original, appimage = self.make_launcher()
+        variants = [
+            original.replace(b'Icon=gitcomet', ('Icon=' + str(appimage)).encode()),
+            original + ('[Desktop Action Another]\nName=Old binary\nExec="' + str(appimage) + '" --action\n').encode(),
+            original + ('[Desktop Action Another]\nName=Old binary\nTryExec=' + str(appimage) + '\nExec=/bin/true\n').encode(),
+        ]
+        for data in variants:
+            with self.subTest(data=data):
+                desktop.write_bytes(data)
+                before = self.snapshot()
+                with self.assertRaisesRegex(mod.Error, 'still references'):
+                    mod.apply(remove_appimage=appimage)
+                self.assertEqual(before, self.snapshot())
+        self.assertTrue(appimage.exists())
+
+    def test_appimage_is_not_removed_when_installed_version_check_fails(self):
+        desktop, original, appimage = self.make_launcher()
+        destination = self.root / 'Application' / 'GitComet'
+        verify = mod.verified_binary
+        def fail_installed(info, directory=None):
+            if directory == destination:
+                raise mod.Error('simulated installed version check failure')
+            return verify(info, directory)
+        with mock.patch.object(mod, 'verified_binary', side_effect=fail_installed):
+            with self.assertRaisesRegex(mod.Error, 'installed version check failure'):
+                mod.apply(install_dir=destination, remove_appimage=appimage)
+        self.assertTrue(appimage.exists())
+        self.assertEqual(desktop.read_bytes(), original)
+        mod.apply(remove_appimage=appimage)
+        self.assertFalse(appimage.exists())
+
+    def test_appimage_changed_during_install_is_not_removed(self):
+        _, _, appimage = self.make_launcher()
+        copy = mod.copy_binary
+        changed = b'new external AppImage contents'
+        def change_original(*args):
+            copy(*args)
+            appimage.write_bytes(changed)
+        with mock.patch.object(mod, 'copy_binary', side_effect=change_original):
+            with self.assertRaisesRegex(mod.Error, 'AppImage changed during installation'):
+                mod.apply(install_dir=self.root / 'Application/GitComet', remove_appimage=appimage)
+        self.assertEqual(appimage.read_bytes(), changed)
+
+    def test_move_refuses_changed_source_and_occupied_destination(self):
+        self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application/GitComet'
+        old_binary = base / 'bin/gitcomet'
+        old_contents = old_binary.read_bytes()
+        old_binary.write_bytes(old_contents + b'\n# external edit\n')
+        before = self.snapshot()
+        with self.assertRaisesRegex(mod.Error, 'installed file has changed'):
+            mod.apply(install_dir=destination)
+        self.assertEqual(before, self.snapshot())
+        old_binary.write_bytes(old_contents)
+        (destination / 'bin').mkdir(parents=True)
+        (destination / 'bin/gitcomet').write_bytes(b'unowned file')
+        before = self.snapshot()
+        with self.assertRaisesRegex(mod.Error, 'untracked installation file'):
+            mod.apply(install_dir=destination)
+        self.assertEqual(before, self.snapshot())
+
+    def test_move_partial_launcher_update_retries_then_cleans_old_runtime(self):
+        entries, _ = self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application/GitComet'
+        second = entries[1][0]
+        appimage = entries[0][2]
+        atomic = mod.write_atomic
+        def fail_second(path, data, mode=0o644):
+            if path == second:
+                raise OSError('simulated partial move')
+            return atomic(path, data, mode)
+        with mock.patch.object(mod, 'write_atomic', side_effect=fail_second):
+            with self.assertRaises(OSError):
+                mod.apply(install_dir=destination, remove_appimage=appimage)
+        self.assertTrue((base / 'run').is_file())
+        self.assertTrue((base / 'bin/gitcomet').is_file())
+        self.assertTrue(appimage.is_file())
+        self.assertIn(str(destination / 'run'), entries[0][0].read_text())
+        self.assertIn(str(base / 'run'), second.read_text())
+        mod.status()
+        mod.apply(remove_appimage=appimage)
+        self.assertFalse((base / 'run').exists())
+        self.assertFalse((base / 'bin/gitcomet').exists())
+        self.assertFalse(appimage.exists())
+        state = mod.load_state(base)
+        self.assertNotIn('moved_from', state)
+        self.assertNotIn('installing', state)
+        self.assertTrue(all('previous_installed_sha256' not in r for r in state['files']))
+        # Repeating the explicit request is safe once the exact original is absent.
+        mod.apply(remove_appimage=appimage)
+
+    def test_move_interrupted_after_binary_copy_retries(self):
+        self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application/GitComet'
+        copy = mod.copy_binary
+        def fail_after_copy(*args):
+            copy(*args)
+            raise OSError('simulated copy interruption')
+        with mock.patch.object(mod, 'copy_binary', side_effect=fail_after_copy):
+            with self.assertRaises(OSError):
+                mod.apply(install_dir=destination)
+        self.assertFalse((destination / 'run').exists())
+        self.assertTrue((base / 'run').exists())
+        mod.status()
+        mod.apply()
+        self.assertTrue((destination / 'run').is_file())
+        self.assertFalse((base / 'run').exists())
+
+    def test_move_cleanup_refuses_source_changed_after_preflight(self):
+        entries, _ = self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application/GitComet'
+        old_wrapper = (base / 'run').read_bytes()
+        atomic = mod.write_atomic
+        def change_old_wrapper(path, data, mode=0o644):
+            result = atomic(path, data, mode)
+            if path == entries[-1][0]:
+                (base / 'run').write_bytes(old_wrapper + b'\n# external edit\n')
+            return result
+        with mock.patch.object(mod, 'write_atomic', side_effect=change_old_wrapper):
+            with self.assertRaisesRegex(mod.Error, 'previous installation file has changed'):
+                mod.apply(install_dir=destination)
+        self.assertTrue((base / 'bin/gitcomet').exists())
+        self.assertEqual((base / 'run').read_bytes(), old_wrapper + b'\n# external edit\n')
+        (base / 'run').write_bytes(old_wrapper)
+        mod.apply()
+        self.assertFalse((base / 'run').exists())
+
+    def test_move_keeps_old_runtime_if_new_wrapper_disappears_before_cleanup(self):
+        entries, _ = self.legacy_install()
+        base, _ = mod.paths()
+        destination = self.root / 'Application/GitComet'
+        atomic = mod.write_atomic
+        def remove_new_wrapper(path, data, mode=0o644):
+            result = atomic(path, data, mode)
+            if path == entries[-1][0]:
+                (destination / 'run').unlink()
+            return result
+        with mock.patch.object(mod, 'write_atomic', side_effect=remove_new_wrapper):
+            with self.assertRaisesRegex(mod.Error, 'installed file has changed'):
+                mod.apply(install_dir=destination, remove_appimage=entries[0][2])
+        self.assertTrue((base / 'run').is_file())
+        self.assertTrue((base / 'bin/gitcomet').is_file())
+        self.assertTrue(entries[0][2].is_file())
+
+    def test_partial_move_can_restore_original_launchers(self):
+        entries, _ = self.legacy_install()
+        destination = self.root / 'Application/GitComet'
+        atomic = mod.write_atomic
+        def fail_second(path, data, mode=0o644):
+            if path == entries[1][0]:
+                raise OSError('simulated partial move')
+            return atomic(path, data, mode)
+        with mock.patch.object(mod, 'write_atomic', side_effect=fail_second):
+            with self.assertRaises(OSError):
+                mod.apply(install_dir=destination)
+        mod.restore()
+        for desktop, original, _ in entries:
+            self.assertEqual(desktop.read_bytes(), original)
+
+    def test_install_directory_file_or_unsupported_path_is_rejected_before_writes(self):
+        self.make_launcher()
+        occupied = self.root / 'regular file'
+        occupied.write_bytes(b'keep this file')
+        for destination in (occupied, self.root / 'bad%path', Path('relative/path')):
+            with self.subTest(destination=destination):
+                before = self.snapshot()
+                with self.assertRaises(mod.Error):
+                    mod.apply(install_dir=destination)
+                self.assertEqual(before, self.snapshot())
+
+    def appimagelauncher_fixture(self, prefixed=True, lite=False):
+        desktop, original, appimage = self.make_launcher('appimagekit_ail-GitComet.desktop')
+        data = b''.join(line for line in original.splitlines(keepends=True) if not line.startswith(b'TryExec='))
+        ids = ['AppImageLauncher-Remove-AppImage', 'AppImageLauncher-Update-AppImage'] if prefixed else ['Remove', 'Update']
+        data = data.replace(b'Icon=gitcomet\n', ('Icon=gitcomet\nX-AppImage-Identifier=keep-this-id\nActions=Test;' + ';'.join(ids) + ';\n').encode())
+        for action_id, verb in zip(ids, ['remove', 'update']):
+            helper = ('/home/example/.local/lib/appimagelauncher-lite/appimagelauncher-lite.AppImage ' + verb
+                      if lite else '/usr/lib64/appimagelauncher/' + verb)
+            data += ('[Desktop Action ' + action_id + ']\nName=AppImage action\nName[ru]=Translated name\n'
+                     'Icon=AppImageLauncher\nExec=' + helper + ' "' + str(appimage) + '"\n').encode()
+        desktop.write_bytes(data)
+        return desktop, data, appimage, ids
+
+    def test_standard_appimagelauncher_actions_are_removed_and_stay_removed(self):
+        for case, (prefixed, lite) in enumerate(((True, False), (False, False), (True, True), (False, True))):
+            with self.subTest(prefixed=prefixed, lite=lite), \
+                    mock.patch.dict(os.environ, {'XDG_DATA_HOME': str(self.root / ('data-case-' + str(case)))}):
+                desktop, original, appimage, ids = self.appimagelauncher_fixture(prefixed, lite)
+                destination = self.root / 'Application' / ('GitComet-' + str(case))
+                mod.apply(install_dir=destination, remove_appimage=appimage)
+                data = desktop.read_bytes()
+                fields = mod.desktop_fields(data)
+                self.assertFalse(appimage.exists())
+                self.assertEqual(fields['TryExec'], str(destination / 'run'))
+                self.assertTrue(Path(fields['TryExec']).is_file())
+                self.assertEqual(fields['Actions'], 'Test;')
+                self.assertEqual(fields['Icon'], 'gitcomet')
+                self.assertEqual(fields['X-AppImage-Identifier'], 'keep-this-id')
+                self.assertIn(b'[Desktop Action Test]\nName=Other section\nExec=/bin/true\n', data)
+                for action_id in ids:
+                    self.assertNotIn(('[Desktop Action ' + action_id + ']').encode(), data)
+                state = mod.load_state(mod.paths()[0])
+                self.assertEqual(Path(state['files'][0]['backup']).read_bytes(), original)
+                self.assertTrue(state['files'][0]['appimage_actions_removed'])
+                with (self.bundle / 'bin/gitcomet').open('a') as stream:
+                    stream.write('\n# updated build\n')
+                mod.apply()  # Never recreate obsolete actions from the original backup.
+                self.assertEqual(desktop.read_bytes(), data)
+
+    def test_same_directory_same_binary_still_applies_action_cleanup(self):
+        desktop, original, appimage, ids = self.appimagelauncher_fixture()
+        mod.apply()
+        self.assertTrue(appimage.exists())
+        self.assertIn(('[Desktop Action ' + ids[0] + ']').encode(), desktop.read_bytes())
+        mod.apply(remove_appimage=appimage)
+        self.assertFalse(appimage.exists())
+        self.assertEqual(mod.desktop_fields(desktop.read_bytes())['Actions'], 'Test;')
+        self.assertEqual(Path(mod.load_state(mod.paths()[0])['files'][0]['backup']).read_bytes(), original)
+
+    def test_same_directory_upgrade_adds_tryexec_missing_in_previous_installer(self):
+        desktop, original, _ = self.make_launcher()
+        desktop.write_bytes(b''.join(line for line in original.splitlines(keepends=True) if not line.startswith(b'TryExec=')))
+        mod.apply()
+        # Reproduce an earlier installed desktop lacking TryExec, with its recorded hash.
+        old_installed = b''.join(line for line in desktop.read_bytes().splitlines(keepends=True) if not line.startswith(b'TryExec='))
+        desktop.write_bytes(old_installed)
+        base, _ = mod.paths()
+        state = mod.load_state(base)
+        state['files'][0]['installed_sha256'] = mod.digest(old_installed)
+        mod.save_state(base, state)
+        mod.apply()
+        self.assertEqual(mod.desktop_fields(desktop.read_bytes())['TryExec'], str(base / 'run'))
+        self.assertEqual(mod.load_state(base)['files'][0]['installed_sha256'], mod.file_digest(desktop))
+
+    def test_custom_generic_remove_update_actions_are_preserved(self):
+        desktop, _, appimage, _ = self.appimagelauncher_fixture()
+        custom = b'[Desktop Action Remove]\nName=Custom remove\nExec=/bin/true\n[Desktop Action Update]\nName=Custom update\nExec=/bin/true\n'
+        desktop.write_bytes(desktop.read_bytes().replace(b'Actions=Test;', b'Actions=Test;Remove;Update;') + custom)
+        mod.apply(remove_appimage=appimage)
+        self.assertIn(custom, desktop.read_bytes())
+        self.assertEqual(mod.desktop_fields(desktop.read_bytes())['Actions'], 'Test;Remove;Update;')
 
 
 if __name__ == '__main__':
