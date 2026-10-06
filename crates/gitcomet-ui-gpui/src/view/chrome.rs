@@ -81,7 +81,7 @@ const _: () = assert!(TITLE_BAR_BUTTON_HEIGHT_PX < TITLE_BAR_HEIGHT_PX);
 /// The trailing min/max/close cluster. Both title bars build it here: the
 /// buttons hold one size, so the spacing around them has to as well, and a
 /// single builder is what stops the two bars drifting apart. `controls` is
-/// `None` on macOS, where the OS draws the caption buttons itself.
+/// `None` when the OS draws the caption buttons itself.
 pub(super) fn window_controls_cluster<E: IntoElement>(controls: Option<(E, E, E)>) -> gpui::Div {
     div()
         .flex()
@@ -521,6 +521,10 @@ impl Render for TitleBarView {
     fn render(&mut self, window: &mut Window, cx: &mut gpui::Context<Self>) -> impl IntoElement {
         let theme = self.theme;
         let is_macos = cfg!(target_os = "macos");
+        let show_window_controls = !is_macos
+            && crate::linux_gui_env::LinuxGuiEnvironment::should_render_custom_window_controls(
+                window.window_decorations(),
+            );
         let workspace_actions_enabled = self.workspace_actions_enabled;
         let repo_tabs_enabled = workspace_actions_enabled
             && self
@@ -861,7 +865,7 @@ impl Render for TitleBarView {
             .child(leading)
             .child(middle)
             .child(window_controls_cluster(
-                (!is_macos).then_some((min, max, close)),
+                show_window_controls.then_some((min, max, close)),
             ))
             .into_any_element()
     }

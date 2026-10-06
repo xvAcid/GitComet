@@ -11,7 +11,7 @@ use gitcomet_core::signing_tools::{
 };
 use gitcomet_state::model::{DefaultTagType, GitLogTagFetchMode};
 use gitcomet_state::session::ExternalCodeEditorSetting;
-use gpui::{Stateful, TitlebarOptions, WindowBounds, WindowDecorations, WindowOptions};
+use gpui::{Stateful, TitlebarOptions, WindowBounds, WindowOptions};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -661,7 +661,9 @@ fn settings_window_options_for_scale(
         window_min_size: Some(settings_window_min_size_for_percent(ui_scale_percent)),
         titlebar: Some(settings_window_titlebar_options()),
         app_id: Some("gitcomet-settings".into()),
-        window_decorations: Some(WindowDecorations::Client),
+        window_decorations: Some(
+            crate::linux_gui_env::LinuxGuiEnvironment::requested_window_decorations(),
+        ),
         window_background: crate::app::main_window_background_appearance(),
         is_movable: true,
         is_resizable: true,

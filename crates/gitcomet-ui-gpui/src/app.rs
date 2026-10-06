@@ -20,8 +20,8 @@ use gitcomet_state::store::AppStore;
 
 use gpui::{
     Action, App, AppContext, BorrowAppContext, Bounds, KeyBinding, Pixels, Point, Size,
-    TitlebarOptions, Unbind, Window, WindowBackgroundAppearance, WindowBounds, WindowDecorations,
-    WindowOptions, actions, px, size,
+    TitlebarOptions, Unbind, Window, WindowBackgroundAppearance, WindowBounds, WindowOptions,
+    actions, px, size,
 };
 #[cfg(target_os = "macos")]
 use gpui::{Menu, MenuItem, OsAction, SystemMenuType};
@@ -539,7 +539,9 @@ fn open_gitcomet_window(
                     ),
                 }),
                 app_id: Some(app_id),
-                window_decorations: Some(WindowDecorations::Client),
+                window_decorations: Some(
+                    crate::linux_gui_env::LinuxGuiEnvironment::requested_window_decorations(),
+                ),
                 window_background: main_window_background_appearance(),
                 is_movable: true,
                 is_resizable: true,

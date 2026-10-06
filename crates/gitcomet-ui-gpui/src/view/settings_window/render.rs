@@ -41,6 +41,10 @@ impl Render for SettingsWindowView {
             .map(chrome::cursor_style_for_resize_edge)
             .unwrap_or(CursorStyle::Arrow);
         let is_macos = cfg!(target_os = "macos");
+        let show_window_controls = !is_macos
+            && crate::linux_gui_env::LinuxGuiEnvironment::should_render_custom_window_controls(
+                decorations,
+            );
         let header_bg = if window.is_window_active() {
             with_alpha(
                 theme.colors.surface.panel,
@@ -208,7 +212,7 @@ impl Render for SettingsWindowView {
                 },
             )
             .child(drag_region)
-            .when(!is_macos, |this| {
+            .when(show_window_controls, |this| {
                 this.child(chrome::window_controls_cluster(Some((min, max, close))))
             });
 

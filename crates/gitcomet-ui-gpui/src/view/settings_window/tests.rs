@@ -270,7 +270,7 @@ fn settings_window_frame_strategy_matches_platform_chrome() {
 }
 
 #[test]
-fn settings_window_options_request_client_chrome_and_resize_behavior() {
+fn settings_window_options_follow_decoration_request_and_resize_behavior() {
     let bounds = Bounds::new(
         point(px(12.0), px(24.0)),
         size(
@@ -295,8 +295,8 @@ fn settings_window_options_request_client_chrome_and_resize_behavior() {
     );
     assert_eq!(
         options.window_decorations,
-        Some(WindowDecorations::Client),
-        "settings window should request client-side decorations"
+        Some(crate::linux_gui_env::LinuxGuiEnvironment::requested_window_decorations()),
+        "settings window should use the same decoration request as the main window"
     );
     assert!(
         options.is_movable,

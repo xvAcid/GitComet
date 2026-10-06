@@ -2,7 +2,9 @@
 use gitcomet_core::platform::detect_is_wsl;
 #[cfg(target_os = "linux")]
 use gitcomet_core::platform::read_linux_osrelease;
-use gpui::Decorations;
+use gpui::{Decorations, WindowDecorations};
+use std::ffi::OsStr;
+use std::sync::OnceLock;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct LinuxGuiEnvironment {
@@ -49,12 +51,36 @@ impl LinuxGuiEnvironment {
     }
 
     pub(crate) fn should_render_custom_window_chrome(decorations: Decorations) -> bool {
+        // This header also contains the app menu and repository tabs.
         let _ = decorations;
         true
     }
 
+    /// Opt in at launch; a compositor may still fall back to client decorations.
+    pub(crate) fn requested_window_decorations() -> WindowDecorations {
+        if Self::native_titlebar_requested() {
+            WindowDecorations::Server
+        } else {
+            WindowDecorations::Client
+        }
+    }
+
+    fn native_titlebar_requested() -> bool {
+        static REQUESTED: OnceLock<bool> = OnceLock::new();
+        *REQUESTED.get_or_init(|| {
+            native_titlebar_requested_from_sources(
+                cfg!(target_os = "linux"),
+                std::env::var_os("GITCOMET_NATIVE_TITLEBAR").as_deref(),
+            )
+        })
+    }
+
+    pub(crate) fn should_render_custom_window_controls(decorations: Decorations) -> bool {
+        !Self::should_suppress_custom_window_frame(decorations)
+    }
+
     pub(crate) fn should_suppress_custom_window_frame(decorations: Decorations) -> bool {
-        !Self::should_render_custom_window_chrome(decorations)
+        native_titlebar_is_active(Self::native_titlebar_requested(), decorations)
     }
 
     #[cfg(any(target_os = "linux", test))]
@@ -72,6 +98,14 @@ impl LinuxGuiEnvironment {
 
         "No GUI session detected. GitComet requires an X11 or Wayland session to open windows. Launch it from an active desktop session.".to_string()
     }
+}
+
+fn native_titlebar_requested_from_sources(is_linux: bool, value: Option<&OsStr>) -> bool {
+    is_linux && value == Some(OsStr::new("1"))
+}
+
+fn native_titlebar_is_active(requested: bool, decorations: Decorations) -> bool {
+    requested && matches!(decorations, Decorations::Server)
 }
 
 #[cfg(target_os = "linux")]
@@ -113,15 +147,36 @@ mod tests {
     }
 
     #[test]
-    fn suppresses_custom_window_frame_for_server_decorations() {
-        assert!(!LinuxGuiEnvironment::should_suppress_custom_window_frame(
-            Decorations::Server
-        ));
-        assert!(!LinuxGuiEnvironment::should_suppress_custom_window_frame(
-            Decorations::Client {
-                tiling: Tiling::default(),
-            }
-        ));
+    fn native_titlebar_requires_explicit_linux_opt_in() {
+        for (is_linux, value, expected) in [
+            (false, Some("1"), false),
+            (true, None, false),
+            (true, Some(""), false),
+            (true, Some("0"), false),
+            (true, Some("true"), false),
+            (true, Some("1"), true),
+            (true, Some(" 1"), false),
+            (true, Some("1 "), false),
+        ] {
+            assert_eq!(
+                native_titlebar_requested_from_sources(is_linux, value.map(OsStr::new)),
+                expected,
+            );
+        }
+    }
+
+    #[test]
+    fn native_titlebar_keeps_custom_controls_and_frame_on_client_fallback() {
+        for requested in [false, true] {
+            assert!(!native_titlebar_is_active(
+                requested,
+                Decorations::Client {
+                    tiling: Tiling::default(),
+                },
+            ));
+        }
+        assert!(!native_titlebar_is_active(false, Decorations::Server));
+        assert!(native_titlebar_is_active(true, Decorations::Server));
     }
 
     #[test]
